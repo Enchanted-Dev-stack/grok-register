@@ -13,17 +13,15 @@ if sys.platform == "win32":
 load_dotenv()
 
 from email_service import EmailService
-from YesCaptcha_service import TurnstileService
+from YesCaptcha_service import TurnstileService, CaptchaAuthError
 
-# 基础配置
+# Base config
 site_url = "https://accounts.x.ai"
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
-PROXIES = {
-    "http": "http://127.0.0.1:7897",
-    "https": "http://127.0.0.1:7897"
-}
+_proxy = str(os.getenv("GROK_PROXY") or "").strip()
+PROXIES = {"http": _proxy, "https": _proxy} if _proxy else None
 
-# 动态获取的全局变量
+# Runtime config filled during init
 config = {
     "site_key": "0x4AAAAAAAhr9JGVDZbrZOo0",
     "action_id": None,
@@ -36,7 +34,7 @@ count_lock = threading.Lock()
 stop_event = threading.Event()
 success_count = 0
 completed_count = 0
-target_count = 0  # 0 = 无限
+target_count = 0  # 0 = unlimited
 start_time = time.time()
 EMAIL_PROVIDER = str(os.getenv("EMAIL_PROVIDER") or "gptmail").strip().lower()
 
@@ -65,12 +63,12 @@ def send_email_code_grpc(session, email):
     data = encode_grpc_message(1, email)
     headers = {"content-type": "application/grpc-web+proto", "x-grpc-web": "1", "x-user-agent": "connect-es/2.1.1", "origin": site_url, "referer": f"{site_url}/sign-up?redirect=grok-com"}
     try:
-        # print(f"[debug] {email} 正在发送验证码请求...")
+        # print(f"[debug] {email} sending verification code request...")
         res = session.post(url, data=data, headers=headers, timeout=15)
-        # print(f"[debug] {email} 请求结束，状态码: {res.status_code}")
+        # print(f"[debug] {email} request finished, status: {res.status_code}")
         return res.status_code == 200
     except Exception as e:
-        print(f"[-] {email} 发送验证码异常: {e}")
+        print(f"[-] {email} send verification code error: {e}")
         return False
 
 def verify_email_code_grpc(session, email, code):
@@ -78,88 +76,92 @@ def verify_email_code_grpc(session, email, code):
     data = encode_grpc_message_verify(email, code)
     headers = {"content-type": "application/grpc-web+proto", "x-grpc-web": "1", "x-user-agent": "connect-es/2.1.1", "origin": site_url, "referer": f"{site_url}/sign-up?redirect=grok-com"}
     try:
-        print(f"[debug] {email} 验证码: {code}, 状态码检查...")
+        print(f"[debug] {email} code: {code}, checking status...")
         res = session.post(url, data=data, headers=headers, timeout=15)
-        # print(f"[debug] {email} 验证响应状态: {res.status_code}, 内容长度: {len(res.content)}")
+        # print(f"[debug] {email} verify response status: {res.status_code}, body length: {len(res.content)}")
         return res.status_code == 200
     except Exception as e:
-        print(f"[-] {email} 验证验证码异常: {e}")
+        print(f"[-] {email} verify code error: {e}")
         return False
 
 def register_single_thread(email_provider: str = "gptmail"):
-    # 错峰启动，防止瞬时并发过高
+    # Stagger thread start to avoid a burst of concurrent requests
     time.sleep(random.uniform(0, 5))
 
     try:
         email_service = EmailService(proxies=PROXIES, provider=email_provider)
         turnstile_service = TurnstileService()
     except Exception as e:
-        print(f"[-] 服务初始化失败: {e}")
+        print(f"[-] Service init failed: {e}")
         return
 
-    # 从 config 获取 action_id，缺少则直接退出
+    # Exit if action_id was not discovered during init
     final_action_id = config.get("action_id")
     if not final_action_id:
-        print("[-] 线程退出：缺少 Action ID")
+        print("[-] Thread exiting: missing Action ID")
         return
 
     while not stop_event.is_set():
         try:
             with requests.Session(impersonate="chrome120", proxies=PROXIES) as session:
-                # 预热连接
+                # Warm up the connection
                 try: session.get(site_url, timeout=10)
                 except: pass
 
                 password = generate_random_string()
                 
-                # print(f"[debug] 线程-{threading.get_ident()} 正在请求创建邮箱...")
+                # print(f"[debug] thread-{threading.get_ident()} requesting inbox...")
                 try:
                     jwt, email = email_service.create_email()
+                except CaptchaAuthError as e:
+                    print(f"[-] {e}")
+                    stop_event.set()
+                    return
                 except Exception as e:
-                    print(f"[-] 邮箱服务抛出异常: {e}")
+                    print(f"[-] Email service error: {e}")
                     jwt, email = None, None
 
                 if not email:
-                    print(f"[-] 线程-{threading.get_ident()} 邮箱创建返回空，可能接口挂了或超时，等待 5s...")
+                    print(f"[-] thread-{threading.get_ident()} email create returned empty (API down or timeout), waiting 5s...")
                     time.sleep(5); continue
                 
-                print(f"[*] 开始注册: {email}")
+                print(f"[*] Starting registration: {email}")
 
-                # Step 1: 发送验证码
+                # Step 1: send verification code
                 if not send_email_code_grpc(session, email):
-                    print(f"[-] {email} 发送验证码失败")
+                    print(f"[-] {email} failed to send verification code")
                     time.sleep(5); continue
                 
-                # Step 2: 获取验证码
+                # Step 2: poll inbox for verification code
                 verify_code = None
                 for _ in range(12):
                     time.sleep(5)
                     content = email_service.fetch_first_email(jwt)
                     if content:
-                        # 兼容新格式："SZ0-0SW xAI confirmation code" 以及 HTML 中的 "SZ0-0SW"
+                        # Also match formats like "SZ0-0SW xAI confirmation code" and HTML "SZ0-0SW"
                         match = re.search(r"([A-Z0-9]{3}-[A-Z0-9]{3})", content)
                         if match:
                             verify_code = match.group(1).replace("-", "")
                             break
                 if not verify_code:
-                    print(f"[-] {email} 未收到验证码")
+                    print(f"[-] {email} did not receive a verification code")
                     continue
 
-                # Step 3: 先解 Turnstile（最耗时），避免验证码过期
+                # Step 3: solve Turnstile first (slowest step) so the code does not expire
                 ts_token = None
                 for ts_attempt in range(3):
                     task_id = turnstile_service.create_task(site_url, config["site_key"])
                     ts_token = turnstile_service.get_response(task_id)
                     if ts_token and ts_token != "CAPTCHA_FAIL":
                         break
-                    print(f"[-] {email} CAPTCHA 失败，重试...")
+                    print(f"[-] {email} CAPTCHA failed, retrying...")
                     time.sleep(2)
                 if not ts_token or ts_token == "CAPTCHA_FAIL":
-                    print(f"[-] {email} CAPTCHA 全部失败")
+                    print(f"[-] {email} CAPTCHA failed after all retries")
                     continue
 
-                # Step 4: 直接提交注册（跳过预验证，避免消耗验证码）
-                for attempt in range(1):  # 只试一次，失败换号重来
+                # Step 4: submit registration (skip pre-verify so the code is not consumed twice)
+                for attempt in range(1):  # one try; on failure, switch email
                     headers = {
                         "user-agent": user_agent, "accept": "text/x-component", "content-type": "text/plain;charset=UTF-8",
                         "origin": site_url, "referer": f"{site_url}/sign-up", "cookie": f"__cf_bm={session.cookies.get('__cf_bm','')}",
@@ -180,9 +182,9 @@ def register_single_thread(email_provider: str = "gptmail"):
                         res = session.post(f"{site_url}/sign-up", json=payload, headers=headers)
                     
                     if res.status_code == 200:
-                        # 尝试多种 SSO 提取方式
+                        # Try several SSO extraction methods
                         sso = None
-                        # 方式1: set-cookie?q= URL (老格式)
+                        # Method 1: set-cookie?q= URL (legacy)
                         for pat in [
                             r'(https://[^"\s]+set-cookie\?q=[^:"\s]+)',
                             r'(https://[^"\s]+set-cookie[^"\s]+)',
@@ -197,10 +199,10 @@ def register_single_thread(email_provider: str = "gptmail"):
                                 sso = session.cookies.get("sso")
                                 if sso:
                                     break
-                        # 方式2: 直接从 response cookies 取
+                        # Method 2: cookie jar
                         if not sso:
                             sso = session.cookies.get("sso")
-                        # 方式3: 检查 Set-Cookie header
+                        # Method 3: Set-Cookie header
                         if not sso:
                             set_cookie = res.headers.get("set-cookie", "")
                             for c in set_cookie.split(","):
@@ -209,11 +211,11 @@ def register_single_thread(email_provider: str = "gptmail"):
                                     if sso_val:
                                         sso = sso_val
                                         break
-                        # 判断：如果响应中包含明确的 invalid-code 错误才是真失败
+                        # Treat as a real failure only when the body has an explicit invalid-code error
                         if '"error"' in res.text and 'invalid' in res.text.lower():
                             if not sso:
-                                print(f"[-] {email} 验证码无效: {res.text[:150]}")
-                            # 如果有 sso 还是算成功（响应格式混乱时）
+                                print(f"[-] {email} invalid verification code: {res.text[:150]}")
+                            # Still count as success if an SSO cookie is present (messy response formats)
 
                         if sso:
                             with file_lock:
@@ -228,40 +230,41 @@ def register_single_thread(email_provider: str = "gptmail"):
                             if target_count > 0 and completed_count >= target_count:
                                 stop_event.set()
 
-                            print(f"[OK] 注册成功: {email} | SSO: {sso[:15]}... | 平均: {avg:.1f}s | 进度: {completed_count}/{target_count if target_count else '无限'}")
+                            print(f"[OK] Registered: {email} | SSO: {sso[:15]}... | avg: {avg:.1f}s | progress: {completed_count}/{target_count if target_count else 'unlimited'}")
                             break
                         elif '"error"' not in res.text or 'invalid' not in res.text.lower():
-                            # 无明显错误但也没 SSO，打印更多信息调试
-                            print(f"[-] {email} 无 SSO (200 OK, len={len(res.text)}): {res.text[:150]}")
-                        # else: 有 invalid 错误且无 SSO，已在上面的 if 打印
+                            # No clear error, but also no SSO — extra debug
+                            print(f"[-] {email} no SSO (200 OK, len={len(res.text)}): {res.text[:150]}")
+                        # else: invalid error and no SSO — already printed above
                     else:
-                        print(f"[-] {email} 提交失败 ({res.status_code}): {res.text[:200]}")
+                        print(f"[-] {email} submit failed ({res.status_code}): {res.text[:200]}")
                     time.sleep(2)
                 else:
-                    print(f"[-] {email} 放弃，换号")
+                    print(f"[-] {email} giving up, switching email")
                     time.sleep(5)
 
         except Exception as e:
-            # 捕获所有异常防止线程退出
-            print(f"[-] 异常: {str(e)[:50]}")
+            # Keep the worker alive on unexpected errors
+            print(f"[-] Error: {str(e)[:50]}")
             time.sleep(5)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--email-provider", choices=["gptmail", "luckmail", "mailtm", "gmail"], default=os.getenv("EMAIL_PROVIDER", "gptmail"), help="邮箱提供商：gptmail/luckmail/mailtm")
-    parser.add_argument("--threads", type=int, default=None, help="并发线程数")
-    parser.add_argument("--count", type=int, default=0, help="总注册数量（0=无限）")
+    parser.add_argument("--email-provider", choices=["gptmail", "luckmail", "mailtm", "gmail"], default=os.getenv("EMAIL_PROVIDER", "gptmail"), help="Email provider: gptmail/luckmail/mailtm/gmail")
+    parser.add_argument("--threads", type=int, default=None, help="Number of worker threads")
+    parser.add_argument("--count", type=int, default=0, help="Total accounts to register (0 = unlimited)")
     args = parser.parse_args()
 
     global target_count
     target_count = args.count
 
-    print("=" * 60 + "\nGrok 注册机\n" + "=" * 60)
-    print(f"[*] 当前邮箱提供商: {args.email_provider}")
-    print(f"[*] 目标数量: {args.count if args.count else '无限'}")
+    print("=" * 60 + "\nGrok registrar\n" + "=" * 60)
+    print(f"[*] Email provider: {args.email_provider}")
+    print(f"[*] Target count: {args.count if args.count else 'unlimited'}")
+    print(f"[*] Proxy: {_proxy or 'none (direct)'}")
 
-    # 1. 扫描参数
-    print("[*] 正在初始化...")
+    # 1. Discover signup parameters
+    print("[*] Initializing...")
     start_url = f"{site_url}/sign-up"
     with requests.Session(impersonate="chrome120", proxies=PROXIES) as s:
         try:
@@ -272,18 +275,18 @@ def main():
             # Tree
             tree_match = re.search(r'next-router-state-tree":"([^"]+)"', html)
             if tree_match: config["state_tree"] = tree_match.group(1)
-            # Action ID — 并发抓取所有 JS 文件（用标准 requests，线程安全+快速）
+            # Action ID — fetch JS chunks in parallel (stdlib requests: thread-safe and fast)
             js_urls = list(set(urljoin(start_url, m.group(0)) for m in re.finditer(r"/_next/static/chunks/[^\"'\s>]+\.js", html)))
             if not js_urls:
-                print(f"[Warn] HTML 长度 {len(html)}, 未解析出 JS，前500字符预览: {html[:500].replace('\n',' ')}")
+                print(f"[Warn] HTML length {len(html)}, no JS URLs parsed. First 500 chars: {html[:500].replace('\n',' ')}")
             action_found = None
-            print(f"[*] 并发搜索 {len(js_urls)} 个 JS 文件中的 Action ID...")
+            print(f"[*] Searching {len(js_urls)} JS files for Action ID...")
 
             def _fetch_and_search(url):
-                """用标准 requests（线程安全），快速扫描 JS 文件找 Action ID"""
+                """Fetch a JS chunk with stdlib requests and look for Action ID."""
                 import requests as _req
                 try:
-                    js = _req.get(url, proxies={"http": PROXIES["http"], "https": PROXIES["https"]}, timeout=10).text
+                    js = _req.get(url, proxies=PROXIES, timeout=10).text
                     m = re.search(r'7f[a-fA-F0-9]{40}', js)
                     if m:
                         return m.group(0)
@@ -306,39 +309,39 @@ def main():
                 except Exception:
                     pass
             else:
-                # 回退缓存 (2026-08-06: 扫描间歇失败时用上次成功的 ID)
+                # Fall back to cache if the live scan misses (intermittent fetch failures)
                 try:
                     cached = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".action_id.cache")).read().strip()
                     if re.match(r"^7f[a-fA-F0-9]{40}$", cached):
                         config["action_id"] = cached
-                        print(f"[+] 使用缓存 Action ID: {cached}")
+                        print(f"[+] Using cached Action ID: {cached}")
                 except Exception:
                     pass
         except Exception as e:
-            print(f"[-] 初始化扫描失败: {e}")
+            print(f"[-] Init scan failed: {e}")
             return
 
     if not config["action_id"]:
-        print("[-] 错误: 未找到 Action ID")
+        print("[-] Error: Action ID not found")
         return
 
-    # 2. 启动
+    # 2. Start workers
     if args.threads is not None:
         t = args.threads
     else:
         try:
-            t = int(input("\n并发数 (默认1): ").strip() or 1)
+            t = int(input("\nThreads (default 1): ").strip() or 1)
         except:
             t = 1
     
-    print(f"[*] 启动 {t} 个线程...")
+    print(f"[*] Starting {t} thread(s)...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=t) as executor:
-        # 只提交与线程数相等的任务，让它们在内部无限循环
+        # One long-running worker per thread
         futures = [executor.submit(register_single_thread, args.email_provider) for _ in range(t)]
         try:
             concurrent.futures.wait(futures)
         except KeyboardInterrupt:
-            print("\n[!] 收到中断信号，准备退出...")
+            print("\n[!] Interrupt received, shutting down...")
 
 if __name__ == "__main__":
     main()

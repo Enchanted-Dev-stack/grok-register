@@ -24,6 +24,8 @@ from curl_cffi import requests
 # 标准 requests 用于 mail.tm（避免 curl_cffi TLS 兼容问题）
 import requests as std_requests
 
+from YesCaptcha_service import CaptchaAuthError
+
 try:
     from luckmail import LuckMailClient
     from luckmail.exceptions import LuckMailError
@@ -85,14 +87,14 @@ class GPTMailClient:
         self._init_browser_session()
         resp = self.session.get(f"{self.base_url}/api/generate-email", timeout=15)
         if resp.status_code != 200:
-            raise RuntimeError(f"GPTMail 生成失败: {resp.status_code}")
+            raise RuntimeError(f"GPTMail generate failed: {resp.status_code}")
         data = resp.json()
         email = str(((data.get("data") or {}).get("email") or "")).strip()
         token = str(((data.get("auth") or {}).get("token") or "")).strip()
         if token:
             self.session.headers.update({"x-inbox-token": token})
         if not email:
-            raise RuntimeError("GPTMail 返回邮箱为空")
+            raise RuntimeError("GPTMail returned an empty inbox")
         return email
 
     def list_emails(self, email: str) -> List[Dict[str, Any]]:
@@ -143,7 +145,7 @@ class MailTMClient:
         else:
             domains = data.get("hydra:member", [])
         if not domains:
-            raise RuntimeError("mail.tm: 无可用域名")
+            raise RuntimeError("mail.tm: no domains available")
         domain = domains[0]["domain"]
 
         # 2. 注册账号
@@ -154,7 +156,7 @@ class MailTMClient:
             "password": self._password,
         }, timeout=15)
         if r2.status_code != 201:
-            raise RuntimeError(f"mail.tm 创建账号失败: {r2.status_code} {r2.text[:200]}")
+            raise RuntimeError(f"mail.tm account create failed: {r2.status_code} {r2.text[:200]}")
         account = r2.json()
         self.address = account["address"]
 
@@ -225,11 +227,11 @@ class LuckMailInbox:
         timeout: int = 30,
     ):
         if LuckMailClient is None:
-            raise RuntimeError("LuckMail SDK 不可用")
+            raise RuntimeError("LuckMail SDK is unavailable")
         if not base_url:
-            raise RuntimeError("缺少 LUCKMAIL_BASE_URL")
+            raise RuntimeError("Missing LUCKMAIL_BASE_URL")
         if not api_key:
-            raise RuntimeError("缺少 LUCKMAIL_API_KEY")
+            raise RuntimeError("Missing LUCKMAIL_API_KEY")
 
         self.client = LuckMailClient(
             base_url=base_url,
@@ -253,19 +255,19 @@ class LuckMailInbox:
                 domain=self.domain,
             )
         except LuckMailError as e:
-            raise RuntimeError(f"LuckMail 购买邮箱失败: {e}") from e
+            raise RuntimeError(f"LuckMail inbox purchase failed: {e}") from e
         except Exception as e:
-            raise RuntimeError(f"LuckMail 初始化失败: {e}") from e
+            raise RuntimeError(f"LuckMail init failed: {e}") from e
 
         purchases = list((result or {}).get("purchases") or [])
         if not purchases:
-            raise RuntimeError("LuckMail 购买邮箱失败：未返回 purchases")
+            raise RuntimeError("LuckMail inbox purchase failed: no purchases returned")
 
         purchase = purchases[0] or {}
         self.address = str(purchase.get("email_address") or "").strip()
         self.token = str(purchase.get("token") or "").strip()
         if not self.address or not self.token:
-            raise RuntimeError("LuckMail 购买邮箱失败：缺少 email_address 或 token")
+            raise RuntimeError("LuckMail inbox purchase failed: missing email_address or token")
         return {"provider": "luckmail", "token": self.token, "email": self.address, "client": self}, self.address
 
     def fetch_first_email(self) -> Optional[str]:
@@ -303,7 +305,7 @@ class LuckMailInbox:
             text = "\n".join([c for c in chunks if c])
             return text or None
         except Exception as e:
-            print(f"获取 LuckMail 邮件失败: {e}")
+            print(f"Failed to fetch LuckMail message: {e}")
             return None
 
 
@@ -315,7 +317,7 @@ class MailNestInbox:
             timeout: int = 30,
     ):
         if not api_key:
-            raise RuntimeError("缺少 MailNest_API_KEY")
+            raise RuntimeError("Missing MAILNEST_API_KEY")
 
         self.api_key = api_key
         self.project_code = project_code
@@ -333,8 +335,8 @@ class MailNestInbox:
             verify=False,
         )
         if resp.status_code == 401:
-            print('api-key 无效')
-            raise Exception('api-key 无效')
+            print('Invalid API key')
+            raise Exception('Invalid API key')
         resp.raise_for_status()
         resp_json = resp.json()
         print(resp_json)
@@ -368,7 +370,7 @@ class MailNestInbox:
             except:
                 pass
         if not email:
-            raise RuntimeError("MailNest 购买邮箱失败")
+            raise RuntimeError("MailNest inbox purchase failed")
         return {"provider": "mailnest", "token": self.api_key, "email": email, "client": self}, email
 
     def fetch_first_email(self, email) -> Optional[str]:
@@ -390,33 +392,40 @@ class MailNestInbox:
                 mails[0]['body'],
             ]) or None
         except Exception as e:
-            print(f"获取 MailNest 邮件失败: {e}")
+            print(f"Failed to fetch MailNest message: {e}")
             return None
 
 
 class GPTMailInboxV2:
-    """GPTMail V2 客户端 — 使用新版 API（2026-07）
+    """GPTMail V2 client.
 
-    API 流程:
-      1. GET  /api/domains/public  → 获取活跃域名列表
-      2. 客户端拼邮箱: prefix@random_domain
-      3. POST /api/inbox-token     → 注册邮箱，获取 JWT token
-      4. GET  /api/emails?email=.. → 轮询邮件
-      5. GET  /api/email/{id}      → 获取邮件详情
+    Flow:
+      1. GET  /api/domains/public
+      2. Build prefix@random_domain
+      3. POST /api/inbox-token (may require Turnstile via /api/browser-verification)
+      4. GET  /api/emails?email=..
+      5. GET  /api/email/{id}
     """
+
+    TURNSTILE_SITEKEY = "0x4AAAAAAD9zdhyrcm6dCJRt"
+    TURNSTILE_ACTION = "inbox_browser_verification"
 
     def __init__(self, proxies: Any = None):
         self.base_url = "https://mail.chatgpt.org.uk"
-        self.session = requests.Session()
+        self.session = requests.Session(impersonate="chrome")
         if proxies:
             self.session.proxies.update(proxies)
         self.session.headers.update({
             "User-Agent": UA,
-            "Accept": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": self.base_url,
+            "Referer": f"{self.base_url}/",
         })
         self.email = ""
         self.token = ""
         self._domains = []
+        self._verified = False
 
     def _warmup(self):
         try:
@@ -430,13 +439,59 @@ class GPTMailInboxV2:
         self._warmup()
         r = self.session.get(f"{self.base_url}/api/domains/public", timeout=15)
         if r.status_code != 200:
-            raise RuntimeError(f"获取域名失败: {r.status_code}")
+            raise RuntimeError(f"Failed to fetch domains: {r.status_code}")
         data = r.json()
         domains_list = (data.get("data") or {}).get("domains") or []
         self._domains = [d["domain_name"] for d in domains_list if d.get("is_active")]
         if not self._domains:
-            raise RuntimeError("无活跃域名")
+            raise RuntimeError("No active domains")
         return self._domains
+
+    def _needs_browser_verification(self, status_code: int, body: Any) -> bool:
+        if status_code == 428:
+            return True
+        if isinstance(body, dict):
+            code = str((body.get("data") or {}).get("code") or "")
+            err = str(body.get("error") or "")
+            return code == "browser_verification_required" or "browser verification" in err.lower()
+        return False
+
+    def _verify_browser(self):
+        if self._verified:
+            return
+        from YesCaptcha_service import TurnstileService
+        print("[*] GPTMail requires browser verification, solving Turnstile...")
+        svc = TurnstileService()
+        task_id = svc.create_task(
+            f"{self.base_url}/",
+            self.TURNSTILE_SITEKEY,
+            action=self.TURNSTILE_ACTION,
+        )
+        token = svc.get_response(task_id)
+        if not token or token == "CAPTCHA_FAIL":
+            raise RuntimeError("GPTMail Turnstile solve failed")
+        r = self.session.post(
+            f"{self.base_url}/api/browser-verification",
+            headers={"Content-Type": "application/json"},
+            json={"turnstile_token": token},
+            timeout=20,
+        )
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+        if r.status_code != 200 or not data.get("success"):
+            raise RuntimeError(f"browser-verification failed: {r.status_code} {data or r.text[:200]}")
+        self._verified = True
+        print("[+] GPTMail browser verification OK")
+
+    def _inbox_token(self, email: str):
+        return self.session.post(
+            f"{self.base_url}/api/inbox-token",
+            headers={"Content-Type": "application/json"},
+            json={"email": email},
+            timeout=15,
+        )
 
     def create_email(self) -> str:
         domains = self._get_domains()
@@ -444,20 +499,25 @@ class GPTMailInboxV2:
         domain = random.choice(domains)
         self.email = f"{prefix}@{domain}"
 
-        r = self.session.post(
-            f"{self.base_url}/api/inbox-token",
-            headers={"Content-Type": "application/json"},
-            json={"email": self.email},
-            timeout=15,
-        )
+        r = self._inbox_token(self.email)
+        try:
+            data = r.json() if r.content else {}
+        except Exception:
+            data = {}
+        if self._needs_browser_verification(r.status_code, data):
+            self._verify_browser()
+            r = self._inbox_token(self.email)
+            try:
+                data = r.json() if r.content else {}
+            except Exception:
+                data = {}
         if r.status_code != 200:
-            raise RuntimeError(f"inbox-token 失败: {r.status_code}")
-        data = r.json()
+            raise RuntimeError(f"inbox-token failed: {r.status_code} {data or r.text[:200]}")
         if not data.get("success"):
-            raise RuntimeError(f"inbox-token 返回失败: {data}")
+            raise RuntimeError(f"inbox-token returned failure: {data}")
         self.token = (data.get("auth") or {}).get("token") or ""
         if not self.token:
-            raise RuntimeError("未获取到 inbox token")
+            raise RuntimeError("Did not receive an inbox token")
         return self.email
 
     def fetch_first_email(self) -> Optional[str]:
@@ -586,8 +646,9 @@ class EmailService:
     def __init__(self, proxies: Any = None, provider: str = "gptmail"):
         self.proxies = proxies
         self.provider = str(provider or os.getenv("EMAIL_PROVIDER") or "gptmail").strip().lower()
+        self._gptmail = None
         if self.provider not in {"gptmail", "mailtm", "luckmail", "mailnest", "gmail"}:
-            raise ValueError(f"不支持的邮箱提供商: {self.provider}")
+            raise ValueError(f"Unsupported email provider: {self.provider}")
 
     def create_email(self):
         if self.provider == "mailtm":
@@ -595,10 +656,10 @@ class EmailService:
                 client = MailTMClient(self.proxies)
                 email = client.create_email()
                 token_like = {"provider": "mailtm", "client": client, "email": email}
-                print(f"[+] mail.tm 邮箱已创建: {email}")
+                print(f"[+] mail.tm inbox created: {email}")
                 return token_like, email
             except Exception as e:
-                print(f"[Error] 请求 mail.tm 出错: {e}")
+                print(f"[Error] mail.tm request failed: {e}")
                 return None, None
         elif self.provider == "luckmail":
             try:
@@ -613,10 +674,10 @@ class EmailService:
                     domain=settings["domain"],
                 )
                 token_like, email = inbox.create_email()
-                print(f"[+] LuckMail 邮箱已购买: {email}")
+                print(f"[+] LuckMail inbox purchased: {email}")
                 return token_like, email
             except Exception as e:
-                print(f"[Error] 请求 LuckMail 出错: {e}")
+                print(f"[Error] LuckMail request failed: {e}")
                 return None, None
         elif self.provider == 'mailnest':
             try:
@@ -626,30 +687,34 @@ class EmailService:
                     project_code=settings["project_code"],
                 )
                 token_like, email = inbox.create_email()
-                print(f"[+] MailNest 邮箱已购买: {email}")
+                print(f"[+] MailNest inbox purchased: {email}")
                 return token_like, email
             except Exception as e:
-                print(f"[Error] 请求 MailNest 出错: {e}")
+                print(f"[Error] MailNest request failed: {e}")
                 return None, None
         elif self.provider == "gmail":
             try:
                 client = GmailIMAPClient(self.proxies)
                 email = client.create_email()
                 token_like = {"provider": "gmail", "client": client, "email": email}
-                print(f"[+] Gmail 别名已创建: {email}")
+                print(f"[+] Gmail alias created: {email}")
                 return token_like, email
             except Exception as e:
-                print(f"[Error] Gmail 出错: {e}")
+                print(f"[Error] Gmail failed: {e}")
                 return None, None
-        # gptmail: 使用 V2 API
+        # gptmail: V2 API (reuse session so Turnstile verification persists)
         try:
-            client = GPTMailInboxV2(self.proxies)
+            if self._gptmail is None:
+                self._gptmail = GPTMailInboxV2(self.proxies)
+            client = self._gptmail
             email = client.create_email()
             token_like = {"provider": "gptmail-v2", "client": client, "email": email}
-            print(f"[+] GPTMail 邮箱已创建: {email}")
+            print(f"[+] GPTMail inbox created: {email}")
             return token_like, email
+        except CaptchaAuthError:
+            raise
         except Exception as e:
-            print(f"[Error] 请求 GPTMail 出错: {e}")
+            print(f"[Error] GPTMail request failed: {e}")
             return None, None
 
     def fetch_first_email(self, token_like):
@@ -684,5 +749,5 @@ class EmailService:
             body_html = str(first.get("html") or first.get("html_content") or "")
             return "\n".join([f">{subject}<", subject, from_name, from_email, body_text, body_html])
         except Exception as e:
-            print(f"获取邮件失败: {e}")
+            print(f"Failed to fetch email: {e}")
             return None

@@ -1,7 +1,6 @@
 import os
-
+import re
 import time
-
 import requests
 
 from dotenv import load_dotenv
@@ -13,6 +12,11 @@ load_dotenv()
 
 
 YESCAPTCHA_SOFT_ID = 102154
+
+
+class CaptchaAuthError(Exception):
+    """YesCaptcha rejected the account key; retrying will not help."""
+    pass
 
 
 
@@ -28,27 +32,33 @@ class TurnstileService:
 
 
 
-    def create_task(self, siteurl, sitekey):
+    def create_task(self, siteurl, sitekey, action: str = ""):
 
         if not self.yescaptcha_key:
 
-            raise Exception("缺少 YESCAPTCHA_KEY，无法创建任务")
+            raise Exception("Missing YESCAPTCHA_KEY, cannot create task")
 
         url = f"{self.yescaptcha_api}/createTask"
+
+        task = {
+
+            "type": "TurnstileTaskProxyless",
+
+            "websiteURL": siteurl,
+
+            "websiteKey": sitekey
+
+        }
+
+        if action:
+
+            task["action"] = action
 
         payload = {
 
             "clientKey": self.yescaptcha_key,
 
-            "task": {
-
-                "type": "TurnstileTaskProxyless",
-
-                "websiteURL": siteurl,
-
-                "websiteKey": sitekey
-
-            },
+            "task": task,
 
             "softID": YESCAPTCHA_SOFT_ID,
 
@@ -62,47 +72,57 @@ class TurnstileService:
 
         if data.get('errorId') != 0:
 
-            raise Exception(f"YesCaptcha创建任务失败: {data.get('errorDescription')}")
+            code = str(data.get("errorCode") or "")
+            desc = str(data.get("errorDescription") or "unknown error")
+            desc = re.sub(r"[a-fA-F0-9]{16,}", "[redacted]", desc)
+            if code == "ERROR_KEY_DOES_NOT_EXIST":
+                raise CaptchaAuthError(
+                    "YESCAPTCHA_KEY was loaded from .env but YesCaptcha rejected it "
+                    "(ERROR_KEY_DOES_NOT_EXIST). Copy a fresh ClientKey from "
+                    "https://yescaptcha.com (user center), or run with "
+                    "--email-provider mailtm"
+                )
+            raise Exception(f"YesCaptcha create task failed: {desc}")
 
         return data['taskId']
 
 
-    def get_response(self, task_id, max_retries=30, initial_delay=5, retry_delay=2):
-        if not self.yescaptcha_key:
-            raise Exception("缺少 YESCAPTCHA_KEY，无法获取结果")
-
-        time.sleep(initial_delay)
-
-        for _ in range(max_retries):
-            try:
-                url = f"{self.yescaptcha_api}/getTaskResult"
-                payload = {
-                    "clientKey": self.yescaptcha_key,
-                    "taskId": task_id
-                }
-                response = requests.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-
-                if data.get('errorId') != 0:
-                    print(f"YesCaptcha获取结果失败: {data.get('errorDescription')}")
-                    return None
-
-                status = data.get('status')
-                if status == 'ready':
-                    token = data.get('solution', {}).get('token')
-                    if token:
-                        return token
-                    print("YesCaptcha返回结果中没有token")
-                    return None
-                elif status == 'processing':
-                    time.sleep(retry_delay)
-                else:
-                    print(f"YesCaptcha未知状态: {status}")
-                    time.sleep(retry_delay)
-            except Exception as e:
-                print(f"获取Turnstile响应异常: {e}")
-                time.sleep(retry_delay)
-
-        return None
+    def get_response(self, task_id, max_retries=30, initial_delay=5, retry_delay=2):
+        if not self.yescaptcha_key:
+            raise Exception("Missing YESCAPTCHA_KEY, cannot get result")
+
+        time.sleep(initial_delay)
+
+        for _ in range(max_retries):
+            try:
+                url = f"{self.yescaptcha_api}/getTaskResult"
+                payload = {
+                    "clientKey": self.yescaptcha_key,
+                    "taskId": task_id
+                }
+                response = requests.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+
+                if data.get('errorId') != 0:
+                    print(f"YesCaptcha get result failed: {data.get('errorDescription')}")
+                    return None
+
+                status = data.get('status')
+                if status == 'ready':
+                    token = data.get('solution', {}).get('token')
+                    if token:
+                        return token
+                    print("YesCaptcha result has no token")
+                    return None
+                elif status == 'processing':
+                    time.sleep(retry_delay)
+                else:
+                    print(f"YesCaptcha unknown status: {status}")
+                    time.sleep(retry_delay)
+            except Exception as e:
+                print(f"Turnstile response error: {e}")
+                time.sleep(retry_delay)
+
+        return None
 
