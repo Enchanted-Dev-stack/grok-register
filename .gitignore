@@ -5,6 +5,7 @@
 keys/
 pending_codes.json
 .action_id.cache
+results.json
 
 # Logs
 *.log

@@ -23,6 +23,7 @@ PROXIES = {"http": _proxy, "https": _proxy} if _proxy else None
 adb_rotate_enabled = False
 adb_serial = None
 adb_every = 3
+captcha_wait_s = 90
 
 TOR_BROWSER_SOCKS = ("127.0.0.1", 9150)  # Tor Browser
 TOR_DAEMON_SOCKS = ("127.0.0.1", 9050)   # system tor
@@ -143,35 +144,58 @@ def verify_email_code_grpc(session, email, code):
         print(f"[-] {email} verify code error: {e}")
         return False
 
-def register_single_thread(email_provider: str = "gptmail", one_shot: bool = False, stagger: float = 0):
+def register_single_thread(
+    email_provider: str = "gptmail",
+    one_shot: bool = False,
+    stagger: float = 0,
+    slot: int = 0,
+    batch_size: int = 0,
+):
     global success_count, completed_count
+    tag = f"[batch {slot}/{batch_size}]" if slot and batch_size else f"[thread-{threading.get_ident()}]"
     if stagger:
         time.sleep(stagger)
     elif not adb_rotate_enabled:
         time.sleep(random.uniform(0, 5))
 
-    try:
-        email_service = EmailService(proxies=PROXIES, provider=email_provider)
-        turnstile_service = TurnstileService(solver=os.getenv("CAPTCHA_SOLVER"))
-    except Exception as e:
-        print(f"[-] Service init failed: {e}")
+    email_service = None
+    turnstile_service = None
+    for init_try in range(8):
+        try:
+            email_service = EmailService(proxies=PROXIES, provider=email_provider)
+            turnstile_service = TurnstileService(solver=os.getenv("CAPTCHA_SOLVER"))
+            break
+        except Exception as e:
+            print(f"[-] {tag} service init failed: {e}")
+            if not one_shot:
+                return
+            time.sleep(5)
+    if not email_service or not turnstile_service:
+        print(f"[-] {tag} giving up: could not init services")
         return
 
     # Manual browser flow does not need Next.js Action ID from curl.
     if captcha_solver_mode() != "manual":
         if not config.get("action_id"):
-            print("[-] Thread exiting: missing Action ID")
+            print(f"[-] {tag} Thread exiting: missing Action ID")
             return
     final_action_id = config.get("action_id")
 
     turnstile_reject_count = 0
     first_account = True
     finished_one = False
+    pre_browser_tries = 0
+    unexpected_errors = 0
+    last_err = None
+    printed_repeat = False
+    oneshot_retry_cap = 8
+
+    def give_up_slot(reason: str) -> None:
+        print(f"[-] {tag} giving up this slot after {oneshot_retry_cap} retries ({reason})")
 
     while not stop_event.is_set():
         if one_shot and finished_one:
             return
-        finished_one = True
         try:
             if adb_rotate_enabled and not one_shot and not first_account:
                 from adb_rotate import rotate_ip
@@ -194,22 +218,35 @@ def register_single_thread(email_provider: str = "gptmail", one_shot: bool = Fal
                     stop_event.set()
                     return
                 except Exception as e:
-                    print(f"[-] Email service error: {e}")
                     jwt, email = None, None
+                    create_detail = str(e)
+                else:
+                    create_detail = ""
 
                 if not email:
-                    print(f"[-] thread-{threading.get_ident()} email create returned empty (API down or timeout), waiting 5s...")
-                    time.sleep(5); continue
-                
-                print(f"[*] Starting registration: {email}")
+                    pre_browser_tries += 1
+                    cap = oneshot_retry_cap if one_shot else "∞"
+                    extra = f": {create_detail}" if create_detail else ""
+                    print(f"[-] {tag} email create failed ({pre_browser_tries}/{cap}){extra}")
+                    if one_shot and pre_browser_tries >= oneshot_retry_cap:
+                        give_up_slot("email create")
+                        return
+                    time.sleep(2)
+                    continue
+
+                print(f"[*] {tag} Starting registration: {email}")
 
                 if turnstile_service.mode == "manual":
                     given = generate_random_name()
                     family = generate_random_name()
 
                     def fetch_code():
-                        for _ in range(12):
-                            time.sleep(5)
+                        for _ in range(20):
+                            if stop_event.is_set():
+                                return None
+                            time.sleep(2)
+                            if stop_event.is_set():
+                                return None
                             content = email_service.fetch_first_email(jwt)
                             if content:
                                 match = re.search(r"([A-Z0-9]{3}-[A-Z0-9]{3})", content)
@@ -218,8 +255,19 @@ def register_single_thread(email_provider: str = "gptmail", one_shot: bool = Fal
                         return None
 
                     from manual_signup import run_manual_signup
-                    print("[*] Edge will open the REAL signup page. Click the captcha when you see it.")
-                    br = run_manual_signup(email, password, given, family, fetch_code)
+                    print(f"[*] {tag} opening Edge for {email}. Click the captcha when you see it.")
+                    br = run_manual_signup(
+                        email, password, given, family, fetch_code, captcha_wait=captcha_wait_s
+                    )
+                    if br.get("retryable"):
+                        pre_browser_tries += 1
+                        print(f"[-] {tag} no browser yet ({pre_browser_tries}/{oneshot_retry_cap}): {br.get('error')}")
+                        if one_shot and pre_browser_tries >= oneshot_retry_cap:
+                            give_up_slot("edge launch")
+                            return
+                        time.sleep(2)
+                        continue
+                    finished_one = True
                     if br.get("error"):
                         print(f"[-] {email} manual signup: {br['error']}")
                         continue
@@ -241,6 +289,9 @@ def register_single_thread(email_provider: str = "gptmail", one_shot: bool = Fal
                         print(f"[-] {email} manual signup produced no SSO")
                     continue
 
+                # This inbox was used for a real signup attempt; consume the one_shot slot.
+                finished_one = True
+
                 # Step 1: send verification code
                 if not send_email_code_grpc(session, email):
                     print(f"[-] {email} failed to send verification code")
@@ -249,7 +300,11 @@ def register_single_thread(email_provider: str = "gptmail", one_shot: bool = Fal
                 # Step 2: poll inbox for verification code
                 verify_code = None
                 for _ in range(12):
+                    if stop_event.is_set():
+                        return
                     time.sleep(5)
+                    if stop_event.is_set():
+                        return
                     content = email_service.fetch_first_email(jwt)
                     if content:
                         # Also match formats like "SZ0-0SW xAI confirmation code" and HTML "SZ0-0SW"
@@ -424,8 +479,20 @@ def register_single_thread(email_provider: str = "gptmail", one_shot: bool = Fal
                     time.sleep(5)
 
         except Exception as e:
-            # Keep the worker alive on unexpected errors
-            print(f"[-] Error: {str(e)[:50]}")
+            if stop_event.is_set():
+                return
+            msg = str(e)[:50]
+            unexpected_errors += 1
+            if msg != last_err:
+                print(f"[-] {tag} Error: {msg}")
+                last_err = msg
+                printed_repeat = False
+            elif not printed_repeat:
+                print(f"[-] {tag} ... repeating, backing off")
+                printed_repeat = True
+            if one_shot and unexpected_errors >= 3:
+                print(f"[-] {tag} giving up this slot after {unexpected_errors} unexpected errors")
+                return
             time.sleep(5)
 
 def main():
@@ -456,6 +523,12 @@ def main():
         help="Accounts to register in parallel per phone IP before ADB rotate (default 3)",
     )
     parser.add_argument("--adb-serial", default=os.getenv("ADB_SERIAL") or "", help="adb device serial if several phones are plugged in")
+    parser.add_argument(
+        "--captcha-wait",
+        type=int,
+        default=90,
+        help="Seconds to wait on the captcha/SSO page before closing that Edge window (default 90)",
+    )
     args = parser.parse_args()
     if args.captcha != "auto":
         os.environ["CAPTCHA_SOLVER"] = args.captcha
@@ -463,8 +536,9 @@ def main():
         os.environ["CAPTCHA_SOLVER"] = ""
     configure_proxy(use_tor=args.tor)
 
-    global target_count, adb_rotate_enabled, adb_serial, adb_every
+    global target_count, adb_rotate_enabled, adb_serial, adb_every, captcha_wait_s
     target_count = args.count
+    captcha_wait_s = max(20, int(args.captcha_wait or 90))
     adb_rotate_enabled = bool(args.adb_rotate)
     adb_serial = (args.adb_serial or "").strip() or None
     adb_every = max(1, int(args.adb_every or 3))
@@ -488,6 +562,8 @@ def main():
     print(f"[*] Target count: {args.count if args.count else 'unlimited'}")
     print(f"[*] Proxy: {_proxy or 'none (direct)'}")
     print(f"[*] Captcha: {captcha_solver_mode()}")
+    if captcha_solver_mode() == "manual":
+        print(f"[*] Captcha wait: {captcha_wait_s}s per window")
     if adb_rotate_enabled:
         print(f"[*] ADB rotate: {adb_every} parallel per IP, then cycle")
 
@@ -590,14 +666,16 @@ def main():
                     batch = min(batch, target_count - completed_count)
                 if batch <= 0:
                     break
-                print(f"[*] Starting parallel batch of {batch}...")
+                print(f"[*] Starting parallel batch of {batch} (up to 8 pre-browser retries per slot)...")
                 with concurrent.futures.ThreadPoolExecutor(max_workers=batch) as executor:
                     futs = [
                         executor.submit(
                             register_single_thread,
                             args.email_provider,
                             True,
-                            i * 1.5,
+                            i * 0.4,
+                            i + 1,
+                            batch,
                         )
                         for i in range(batch)
                     ]
@@ -624,6 +702,7 @@ def main():
             concurrent.futures.wait(futures)
         except KeyboardInterrupt:
             print("\n[!] Interrupt received, shutting down...")
+            stop_event.set()
 
 if __name__ == "__main__":
     main()

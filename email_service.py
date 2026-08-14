@@ -652,70 +652,48 @@ class EmailService:
 
     def create_email(self):
         if self.provider == "mailtm":
-            try:
-                client = MailTMClient(self.proxies)
-                email = client.create_email()
-                token_like = {"provider": "mailtm", "client": client, "email": email}
-                print(f"[+] mail.tm inbox created: {email}")
-                return token_like, email
-            except Exception as e:
-                print(f"[Error] mail.tm request failed: {e}")
-                return None, None
-        elif self.provider == "luckmail":
-            try:
-                settings = _luckmail_settings()
-                inbox = LuckMailInbox(
-                    base_url=settings["base_url"],
-                    api_key=settings["api_key"],
-                    api_secret=settings["api_secret"],
-                    use_hmac=settings["use_hmac"],
-                    project_code=settings["project_code"],
-                    email_type=settings["email_type"],
-                    domain=settings["domain"],
-                )
-                token_like, email = inbox.create_email()
-                print(f"[+] LuckMail inbox purchased: {email}")
-                return token_like, email
-            except Exception as e:
-                print(f"[Error] LuckMail request failed: {e}")
-                return None, None
-        elif self.provider == 'mailnest':
-            try:
-                settings = _mailnest_settings()
-                inbox = MailNestInbox(
-                    api_key=settings["api_key"],
-                    project_code=settings["project_code"],
-                )
-                token_like, email = inbox.create_email()
-                print(f"[+] MailNest inbox purchased: {email}")
-                return token_like, email
-            except Exception as e:
-                print(f"[Error] MailNest request failed: {e}")
-                return None, None
-        elif self.provider == "gmail":
-            try:
-                client = GmailIMAPClient(self.proxies)
-                email = client.create_email()
-                token_like = {"provider": "gmail", "client": client, "email": email}
-                print(f"[+] Gmail alias created: {email}")
-                return token_like, email
-            except Exception as e:
-                print(f"[Error] Gmail failed: {e}")
-                return None, None
-        # gptmail: V2 API (reuse session so Turnstile verification persists)
-        try:
-            if self._gptmail is None:
-                self._gptmail = GPTMailInboxV2(self.proxies)
-            client = self._gptmail
+            client = MailTMClient(self.proxies)
             email = client.create_email()
-            token_like = {"provider": "gptmail-v2", "client": client, "email": email}
-            print(f"[+] GPTMail inbox created: {email}")
+            token_like = {"provider": "mailtm", "client": client, "email": email}
+            print(f"[+] mail.tm inbox created: {email}")
             return token_like, email
-        except CaptchaAuthError:
-            raise
-        except Exception as e:
-            print(f"[Error] GPTMail request failed: {e}")
-            return None, None
+        elif self.provider == "luckmail":
+            settings = _luckmail_settings()
+            inbox = LuckMailInbox(
+                base_url=settings["base_url"],
+                api_key=settings["api_key"],
+                api_secret=settings["api_secret"],
+                use_hmac=settings["use_hmac"],
+                project_code=settings["project_code"],
+                email_type=settings["email_type"],
+                domain=settings["domain"],
+            )
+            token_like, email = inbox.create_email()
+            print(f"[+] LuckMail inbox purchased: {email}")
+            return token_like, email
+        elif self.provider == "mailnest":
+            settings = _mailnest_settings()
+            inbox = MailNestInbox(
+                api_key=settings["api_key"],
+                project_code=settings["project_code"],
+            )
+            token_like, email = inbox.create_email()
+            print(f"[+] MailNest inbox purchased: {email}")
+            return token_like, email
+        elif self.provider == "gmail":
+            client = GmailIMAPClient(self.proxies)
+            email = client.create_email()
+            token_like = {"provider": "gmail", "client": client, "email": email}
+            print(f"[+] Gmail alias created: {email}")
+            return token_like, email
+        # gptmail: V2 API (reuse session so Turnstile verification persists)
+        if self._gptmail is None:
+            self._gptmail = GPTMailInboxV2(self.proxies)
+        client = self._gptmail
+        email = client.create_email()
+        token_like = {"provider": "gptmail-v2", "client": client, "email": email}
+        print(f"[+] GPTMail inbox created: {email}")
+        return token_like, email
 
     def fetch_first_email(self, token_like):
         try:
@@ -749,5 +727,11 @@ class EmailService:
             body_html = str(first.get("html") or first.get("html_content") or "")
             return "\n".join([f">{subject}<", subject, from_name, from_email, body_text, body_html])
         except Exception as e:
-            print(f"Failed to fetch email: {e}")
+            inbox = ""
+            if isinstance(token_like, dict):
+                inbox = str(token_like.get("email") or "")
+            key = (inbox, str(e)[:80])
+            if getattr(self, "_last_fetch_err", None) != key:
+                self._last_fetch_err = key
+                print(f"Failed to fetch email: {e}")
             return None

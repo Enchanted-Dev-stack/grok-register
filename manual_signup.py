@@ -181,14 +181,29 @@ async def run_manual_signup_async(
     if proxy:
         launch_kwargs["proxy"] = {"server": proxy}
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(viewport={"width": 1280, "height": 900})
-        page = await context.new_page()
+    try:
+        playwright = await async_playwright().start()
+    except Exception as e:
+        return {"error": f"playwright start failed: {e}"[:280], "retryable": True}
+
+    browser = None
+    context = None
+    try:
+        try:
+            browser = await playwright.chromium.launch(**launch_kwargs)
+            context = await browser.new_context(viewport={"width": 1280, "height": 900})
+            page = await context.new_page()
+        except Exception as e:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            return {"error": f"edge launch failed: {e}"[:280], "retryable": True}
         try:
             print(f"[manual] opening {SIGNUP} in {channel}")
-            await page.goto(SIGNUP, wait_until="load", timeout=45_000)
-            await page.wait_for_timeout(2500)
+            await page.goto(SIGNUP, wait_until="domcontentloaded", timeout=45_000)
+            await page.wait_for_timeout(800)
             blocked = await _page_blocked(page)
             if blocked:
                 return {
@@ -197,16 +212,16 @@ async def run_manual_signup_async(
 
             if not await _click_signup_email(page):
                 print("[manual] click the 'Sign up with email' button yourself")
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(600)
             await _dismiss_cookies(page)
 
             print(f"[manual] filling email {email}")
             if not await _fill_visible_input(page, email):
                 print("[manual] type the email yourself in Edge")
-            await page.wait_for_timeout(400)
+            await page.wait_for_timeout(200)
             if not await _click_primary(page, "Continue", "Next", "Send code", "Verify"):
                 await page.keyboard.press("Enter")
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(500)
 
             print("[manual] waiting for verification email...")
             code = await asyncio.to_thread(fetch_code)
@@ -215,19 +230,19 @@ async def run_manual_signup_async(
             else:
                 print(f"[manual] code {code[:3]}-{code[3:6]}")
                 await _fill_otp(page, code)
-                await page.wait_for_timeout(400)
+                await page.wait_for_timeout(200)
                 if not await _click_primary(page, "Confirm email", "Confirm", "Continue", "Verify"):
                     await page.keyboard.press("Enter")
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(800)
 
             # Stay on verify-email until the next step actually appears.
-            for _ in range(20):
+            for _ in range(15):
                 heading = (await _heading_text(page)).lower()
                 has_pw = await page.locator('input[type="password"]').count() > 0
                 has_cf = await page.locator("iframe[src*='challenges.cloudflare'], iframe[src*='turnstile']").count() > 0
                 if has_pw or has_cf or (heading and "verify" not in heading):
                     break
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(250)
 
             print("[manual] filling name/password if those fields are on screen")
             try:
@@ -300,11 +315,27 @@ async def run_manual_signup_async(
         except Exception as e:
             return {"error": str(e)[:300]}
         finally:
-            await context.close()
-            await browser.close()
+            if context:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+    finally:
+        try:
+            await playwright.stop()
+        except Exception:
+            pass
 
 
 def run_manual_signup(email, password, given, family, fetch_code, captcha_wait=180) -> dict:
-    return asyncio.run(
-        run_manual_signup_async(email, password, given, family, fetch_code, captcha_wait)
-    )
+    try:
+        return asyncio.run(
+            run_manual_signup_async(email, password, given, family, fetch_code, captcha_wait)
+        )
+    except Exception as e:
+        return {"error": f"edge launch failed: {e}"[:280], "retryable": True}
