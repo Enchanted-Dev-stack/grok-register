@@ -9,4 +9,8 @@ dependencies = [
     "curl_cffi",
     "python-dotenv",
     "requests",
+    "pysocks",
+    "patchright",
+    "quart",
+    "camoufox>=0.5.4",
 ]
