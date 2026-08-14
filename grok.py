@@ -529,7 +529,39 @@ def main():
         default=90,
         help="Seconds to wait on the captcha/SSO page before closing that Edge window (default 90)",
     )
+    parser.add_argument(
+        "--target",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--scenario",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--users",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--duration",
+        default="",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
+    if str(args.scenario or "").strip():
+        def _passed(flag: str) -> bool:
+            return any(a == flag or a.startswith(flag + "=") for a in sys.argv[1:])
+
+        if not _passed("--email-provider"):
+            args.email_provider = "mailtm"
+        if not _passed("--captcha"):
+            args.captcha = "manual"
+        if not _passed("--count"):
+            args.count = int(args.users) if args.users else 2000
+        print(f"[*] scenario={args.scenario} target={args.target or '(default)'} duration={args.duration or '-'}")
     if args.captcha != "auto":
         os.environ["CAPTCHA_SOLVER"] = args.captcha
     elif "CAPTCHA_SOLVER" not in os.environ:
